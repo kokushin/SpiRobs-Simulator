@@ -163,6 +163,7 @@ export class SpiRobPhysics {
   private graspBaseOffset = new CANNON.Vec3();
   private wrapDirection = 1;
   private previousWrapProgress = 0;
+  private smoothedWrapAnchor: CANNON.Vec3 | null = null;
   private bodyMaterial = new CANNON.Material('TPU 95A');
   private floorMaterial = new CANNON.Material('laboratory surface');
   private objectMaterial = new CANNON.Material('grasped object');
@@ -302,6 +303,7 @@ export class SpiRobPhysics {
     this.graspReferenceUnit = -1;
     this.wrapProgress = 0;
     this.previousWrapProgress = 0;
+    this.smoothedWrapAnchor = null;
     this.build();
   }
 
@@ -311,6 +313,7 @@ export class SpiRobPhysics {
     this.isGrasping = false;
     this.wrapProgress = 0;
     this.previousWrapProgress = 0;
+    this.smoothedWrapAnchor = null;
   }
 
   /**
@@ -393,6 +396,29 @@ export class SpiRobPhysics {
     return worldPoint.vsub(sample.normal.scale(sample.distance));
   }
 
+  /**
+   * The wrap anchor must move continuously. Candidate selection can flip
+   * between the two symmetric reach solutions and the start unit changes in
+   * discrete steps; any anchor jump becomes a (jump / dt) kinematic velocity
+   * spike, so the anchor is rate-limited and kept on the enlarged surface.
+   */
+  private advanceWrapAnchor(target: CANNON.Vec3, margin: number) {
+    if (!this.smoothedWrapAnchor) {
+      this.smoothedWrapAnchor = target.clone();
+      return this.smoothedWrapAnchor.clone();
+    }
+    const delta = target.vsub(this.smoothedWrapAnchor);
+    const distance = delta.length();
+    const maxStep = 0.0035;
+    if (distance > maxStep) {
+      this.smoothedWrapAnchor.vadd(delta.scale(maxStep / distance), this.smoothedWrapAnchor);
+      this.smoothedWrapAnchor.copy(this.projectToObjectSurface(this.smoothedWrapAnchor, margin));
+    } else {
+      this.smoothedWrapAnchor.copy(target);
+    }
+    return this.smoothedWrapAnchor.clone();
+  }
+
   private connectProximalChain(
     positions: CANNON.Vec3[],
     endUnit: number,
@@ -416,10 +442,26 @@ export class SpiRobPhysics {
         const distance = Math.max(1e-8, delta.length());
         positions[i - 1].vadd(delta.scale(restLength / distance), positions[i]);
       }
+      // A straight FABRIK chain happily cuts through the target when the
+      // anchor sits past the horizon, so intermediate units are pushed back
+      // onto the enlarged surface inside the same relaxation loop.
+      for (let i = 1; i < endUnit; i++) {
+        const robotRadius = Math.min(UNIT_DATA[i][2], UNIT_DATA[i][3]) * MM * 0.43;
+        const sample = this.sampleObjectSurface(positions[i], robotRadius + 0.00035);
+        if (sample.distance >= 0) continue;
+        positions[i].vsub(sample.normal.scale(sample.distance), positions[i]);
+      }
     }
     const endpointError = endPosition.vsub(positions[endUnit]);
     for (let i = 1; i <= endUnit; i++) positions[i].vadd(endpointError.scale(i / endUnit), positions[i]);
     positions[endUnit].copy(endPosition);
+    // The endpoint-error smear above ignores the surface constraint and can
+    // push relaxed interior units back inside the object.
+    for (let i = 1; i < endUnit; i++) {
+      const robotRadius = Math.min(UNIT_DATA[i][2], UNIT_DATA[i][3]) * MM * 0.43;
+      const sample = this.sampleObjectSurface(positions[i], robotRadius + 0.00035);
+      if (sample.distance < 0) positions[i].vsub(sample.normal.scale(sample.distance), positions[i]);
+    }
   }
 
   private constrainRodAroundObject(positions: CANNON.Vec3[]) {
@@ -458,6 +500,7 @@ export class SpiRobPhysics {
 
     if (this.wrapProgress <= 0.02) {
       this.previousWrapProgress = this.wrapProgress;
+      this.smoothedWrapAnchor = null;
       return;
     }
     // Contact-path following for the commanded wrap phase. Distal unit centers
@@ -486,13 +529,15 @@ export class SpiRobPhysics {
         const rootDistance = root.distanceTo(candidate);
         if (rootDistance > proximalLength * 1.002) continue;
         const reachScore = Math.abs(rootDistance - proximalLength * 0.94);
-        const continuityScore = Math.sqrt(candidate.distanceSquared(positions[startUnit])) * 0.18;
+        const continuityReference = this.smoothedWrapAnchor ?? positions[startUnit];
+        const continuityScore = Math.sqrt(candidate.distanceSquared(continuityReference)) * 0.18;
         const score = reachScore + continuityScore;
         if (score < bestScore) {
           bestScore = score;
           wrapAnchor = candidate;
         }
       }
+      wrapAnchor = this.advanceWrapAnchor(wrapAnchor, firstRadius + 0.00035);
 
       this.connectProximalChain(positions, startUnit, wrapAnchor, root);
       let surfaceNormal = this.sampleObjectSurface(wrapAnchor, firstRadius + 0.00035).normal;
@@ -541,7 +586,9 @@ export class SpiRobPhysics {
     const perpendicular = new CANNON.Vec3(-centerDirection.y, centerDirection.x, 0);
     const candidateA = intersectionBase.vadd(perpendicular.scale(height));
     const candidateB = intersectionBase.vsub(perpendicular.scale(height));
-    const wrapAnchor = candidateA.distanceSquared(positions[startUnit]) <= candidateB.distanceSquared(positions[startUnit]) ? candidateA : candidateB;
+    const anchorReference = this.smoothedWrapAnchor ?? positions[startUnit];
+    const chosenAnchor = candidateA.distanceSquared(anchorReference) <= candidateB.distanceSquared(anchorReference) ? candidateA : candidateB;
+    const wrapAnchor = this.advanceWrapAnchor(chosenAnchor, firstRadius + 0.00035);
 
     this.connectProximalChain(positions, startUnit, wrapAnchor, root);
 
@@ -662,6 +709,30 @@ export class SpiRobPhysics {
     }
 
     this.constrainRodAroundObject(targetPositions);
+
+    // Rate-limit how far any unit may travel in one substep. When the wrap
+    // constraint engages (or the anchor/start unit shifts) the constrained
+    // target can sit far from the body; without a limit that distance turns
+    // into a (gap / dt) velocity spike that kicks the solver and the target.
+    const followObject = !!this.objectBody
+      && this.settings.objectKind !== 'none'
+      && (this.objectBody.type === CANNON.Body.KINEMATIC || this.graspLatched);
+    const maxTravel = 0.008;
+    for (let i = 1; i < this.bodies.length; i++) {
+      const body = this.bodies[i];
+      const delta = targetPositions[i].vsub(body.position);
+      const distance = delta.length();
+      if (distance > maxTravel) {
+        body.position.vadd(delta.scale(maxTravel / distance), targetPositions[i]);
+        // The shortened path may cut into the target object; keep the
+        // clamped waypoint outside the enlarged surface as well.
+        if (followObject) {
+          const robotRadius = Math.min(UNIT_DATA[i][2], UNIT_DATA[i][3]) * MM * 0.43;
+          const sample = this.sampleObjectSurface(targetPositions[i], robotRadius + 0.00035);
+          if (sample.distance < 0) targetPositions[i].vsub(sample.normal.scale(sample.distance), targetPositions[i]);
+        }
+      }
+    }
 
     for (let i = 1; i < this.bodies.length; i++) {
       const child = this.bodies[i];
@@ -813,8 +884,12 @@ export class SpiRobPhysics {
         // F/m·dt² preserves the calibrated holding-force ceiling without the
         // light-object instability of an explicit stiff spring.
         const maxCorrection = maxHoldingForce / Math.max(1e-5, this.settings.objectMass) * dt * dt;
+        // The rod re-follows the object surface one substep later, so any
+        // single-substep object step reappears as that much penetration.
+        // 1 mm per substep (0.12 m/s) is ample for recentring drift.
+        const maxObjectStep = 0.001;
         const correctionRatio = distance > 1e-8
-          ? Math.min(1 - Math.exp(-dt * 42), maxCorrection / distance)
+          ? Math.min(1 - Math.exp(-dt * 42), maxCorrection / distance, maxObjectStep / distance)
           : 0;
         this.objectBody.position.vadd(error.scale(correctionRatio), this.objectBody.position);
         this.objectBody.velocity.scale(0.32, this.objectBody.velocity);
