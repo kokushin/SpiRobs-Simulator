@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from spirob_mujoco import SimSettings, SpiRobSim, auto_grasp_command, build_mjcf
+from spirob_mujoco import grasp
 from spirob_mujoco.unit_data import UNIT_COUNT
 
 
@@ -71,12 +72,16 @@ def test_capstan_attenuates_distal_tension():
     assert tip < base * 0.75
 
 
-def test_rigid_sphere_rests_on_stage():
-    sim = make_sim(object_kind="sphere")
+@pytest.mark.parametrize("size_mm", [35.0, 52.0, 80.0])
+@pytest.mark.parametrize("mount", ["standing", "hanging"])
+def test_rigid_sphere_presented_at_grasp_height(mount, size_mm):
+    # The presentation rig (string for standing, size-compensated pedestal
+    # for hanging) must put the object CENTER at grasp_center_z regardless
+    # of size, like the web simulator's fixture and the paper's hand-off.
+    sim = make_sim(object_kind="sphere", object_size_mm=size_mm, mount=mount)
     sim.step(1.0)
     obj = sim.data.xpos[mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "object")]
-    expected_z = 0.075 + 0.026  # pedestal top + radius
-    assert obj[2] == pytest.approx(expected_z, abs=0.006)
+    assert obj[2] == pytest.approx(sim.settings.grasp_center_z, abs=0.006)
 
 
 def test_soft_sphere_compiles_and_is_stable():
@@ -94,39 +99,56 @@ def test_soft_sphere_compiles_and_is_stable():
 
 def test_paper_schedule_phases():
     assert auto_grasp_command(0.5).phase == "packing"
-    assert auto_grasp_command(2.0).phase == "reaching"
+    assert auto_grasp_command(3.0).phase == "reaching"
     assert auto_grasp_command(6.0).phase == "wrapping"
-    assert auto_grasp_command(9.0).phase == "grasping"
-    assert auto_grasp_command(11.0).phase == "holding"
-    # Antagonism: primary cable packs at 6 N, the opposing pair share the
-    # reach tension equally.
+    assert auto_grasp_command(10.0).phase == "grasping"
+    assert auto_grasp_command(11.5).phase == "holding"
+    # Antagonism: primary cable packs at F_PACK, the opposing pair share
+    # the reach tension equally.
     reaching = auto_grasp_command(4.0, primary_cable=1)
-    assert reaching.cable_forces[1] == pytest.approx(6.0)
+    assert reaching.cable_forces[1] == pytest.approx(grasp.F_PACK)
     assert reaching.cable_forces[0] == reaching.cable_forces[2]
     holding = auto_grasp_command(12.0)
-    assert holding.cable_forces[0] == pytest.approx(5.2)
-    assert holding.cable_forces[1] == pytest.approx(9.0)
+    assert holding.cable_forces[0] == pytest.approx(grasp.F_WRAP)
+    assert holding.cable_forces[1] == pytest.approx(grasp.F_GRASP)
 
 
-@pytest.mark.parametrize("kind", ["sphere", "soft_sphere"])
+def test_planar_hand_carries_rod_in_during_reach():
+    """Paper Fig. 3A presentation: the rod parks ahead of the arm while the
+    tip spiral packs (no interference), then the hand carries it to the
+    grasp pose during REACH."""
+    sim = make_sim()  # planar cylinder default
+    sim.step(0.5)
+    obj_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "object")
+    parked_x = sim.data.xpos[obj_id][0]
+    assert parked_x > sim.settings.object_x + 0.05  # clear of the packing sweep
+    sim.start_auto_grasp()
+    sim.step(5.5)  # PACK + REACH complete
+    assert sim.data.xpos[obj_id][0] == pytest.approx(sim.settings.object_x, abs=0.01)
+    assert sim.data.xpos[obj_id][1] == pytest.approx(sim.settings.object_y, abs=0.01)
+
+
+@pytest.mark.parametrize("kind", ["cylinder", "soft_sphere"])
 def test_paper_sequence_reaches_object(kind):
-    """The full Fig. 3A run must stay stable, the stage must deliver the
-    object, and the descending spiral must at least touch it during the
-    wrap phase. Whether the grasp closes and holds is an open calibration
-    question — see README — so contact, not capture, is asserted here."""
+    """The full Fig. 3A run must stay stable and (for the hand-presented
+    rod) the climbing spiral must wrap the rod with several units during
+    wrap/grasp. Whether the grasp still holds after the hand lets go is an
+    open calibration question — see README — so contact, not capture, is
+    asserted here."""
     sim = make_sim(object_kind=kind)
     sim.step(1.0)
     sim.start_auto_grasp()
     max_contacts = 0
-    while sim.data.time - 1.0 < 10.2:
+    while sim.data.time - 1.0 < 11.0:
         sim.step(0.5)
         max_contacts = max(max_contacts, len(sim.contacting_units()))
     assert np.all(np.isfinite(sim.data.qpos))
-    assert max_contacts >= 1
-    sim.step(4.0)  # holding + stage retract: must stay finite, no catapult
+    if kind == "cylinder":
+        assert max_contacts >= 3
+    sim.step(5.0)  # holding + release: must stay finite, no catapult
     assert np.all(np.isfinite(sim.data.qpos))
     state = sim.state()
-    if kind == "sphere":
+    if kind == "cylinder":
         pos = np.array(state["object"]["pos"])
         assert np.linalg.norm(pos[:2]) < 0.5
 

@@ -19,12 +19,19 @@ from math import cos, radians, sin
 from .settings import SimSettings
 from .unit_data import MM, UNIT_COUNT, UNIT_DATA, along_m, cable_radius_m, unit_volumes
 
-# Base pose per mount. Hanging: arm points straight down (+X body axis
-# rotated onto -Z) from high enough that the straight arm tip clears the
-# pedestal; the packing cable 0 then curls the spiral toward -X.
+# Base pose per mount. Planar is the paper's Fig. 3A arrangement seen in
+# the figure's top-view photos: the arm lies on a smooth table and curls in
+# the HORIZONTAL plane, so gravity acts perpendicular to the bending plane
+# instead of fighting the spiral. The base quat rotates the body frame 90
+# deg about +X, which maps the packing cable 0 (body -Z) onto world +Y: the
+# spiral curls toward +Y where the rod is presented. Standing/hanging are
+# legacy vertical-plane scenes (gravity in-plane), horizontal matches the
+# web simulator's default cantilever.
 MOUNT_POSE = {
+    "planar": {"pos": (0.0, 0.0, 0.0125), "quat": (0.70710678, 0.70710678, 0.0, 0.0)},
     "horizontal": {"pos": (-0.06, 0.0, 0.2), "quat": (1.0, 0.0, 0.0, 0.0)},
     "hanging": {"pos": (0.0, 0.0, 0.32), "quat": (0.70710678, 0.0, 0.70710678, 0.0)},
+    "standing": {"pos": (0.0, 0.0, 0.02), "quat": (0.70710678, 0.0, -0.70710678, 0.0)},
 }
 JOINT_RANGE_DEG = 28.8  # 30 deg paper limit x 0.96, same margin as the rod solver
 CABLE_PHASES_DEG = (0.0, 120.0, 240.0)
@@ -34,7 +41,18 @@ MAX_CABLE_FORCE = 15.0
 # the REACH phase carrying the object by friction, and retracts during
 # HOLDING so the wrap alone must carry the weight.
 PEDESTAL_RADIUS = 0.016
-PEDESTAL_FAR_OFFSET = -0.13
+
+
+def pedestal_far_offset(mount: str) -> float:
+    """Stage parking offset relative to the grasp point.
+
+    The stage waits on the side the object is delivered from: -X for the
+    hanging/horizontal scenes, +X for the standing scene whose packing
+    spiral curls toward +X. Planar has no stage (the rod is hand-held).
+    """
+    if mount == "planar":
+        return 0.0
+    return 0.15 if mount == "standing" else -0.13
 
 
 def _fmt(*values: float) -> str:
@@ -88,6 +106,16 @@ def build_mjcf(settings: SimSettings) -> str:
 
     worldbody = ET.SubElement(root, "worldbody")
     ET.SubElement(worldbody, "light", pos="0 0 1.5", dir="0 0 -1")
+    # Planar scene: the floor is the paper's smooth table the arm slides on
+    # while curling, so its friction must be low — and because MuJoCo takes
+    # the element-wise max of the two geom frictions, the table also needs
+    # priority=1 so its low mu actually governs table contacts (the arm and
+    # object keep their high mutual friction for the grasp itself).
+    floor_attrs = {}
+    if settings.mount == "planar":
+        floor_attrs = {"friction": _fmt(0.25, 0.005, 0.0001), "priority": "1"}
+    else:
+        floor_attrs = {"friction": _fmt(0.92, 0.005, 0.0001)}
     ET.SubElement(
         worldbody,
         "geom",
@@ -95,8 +123,8 @@ def build_mjcf(settings: SimSettings) -> str:
         type="plane",
         size="1 1 0.05",
         pos="0 0 0",
-        friction=_fmt(0.92, 0.005, 0.0001),
         rgba="0.35 0.37 0.4 1",
+        **floor_attrs,
     )
 
     volumes = unit_volumes()
@@ -200,7 +228,7 @@ def build_mjcf(settings: SimSettings) -> str:
                 ctrlrange=_fmt(0, MAX_CABLE_FORCE),
             )
 
-    if settings.object_kind != "none":
+    if settings.object_kind != "none" and _uses_stage(settings):
         # Stage servo (always the LAST actuator; the capstan controller
         # relies on the cable motors occupying ctrl[0:57]).
         ET.SubElement(
@@ -210,18 +238,58 @@ def build_mjcf(settings: SimSettings) -> str:
             joint="stage_x",
             kp="400",
             kv="60",
-            ctrlrange=_fmt(-0.05, 0.2),
+            ctrlrange=_fmt(-0.25, 0.25),
         )
 
     return ET.tostring(root, encoding="unicode")
+
+
+STRING_ANCHOR_DROP = 0.25  # string length: anchor sits this far above the object
+
+
+def _uses_stage(settings: SimSettings) -> bool:
+    """Whether the object is presented on the rail stage.
+
+    The planar scene never uses the stage: the rod is hand-held (a weld
+    released during HOLDING). The standing scene never uses it either: a
+    pedestal under the object blocks the arm from closing beneath it,
+    making form closure geometrically impossible — rigid objects hang from
+    a string instead, and soft objects rest on the floor (the paper's
+    Fig. 5C table scenario — no string attachment point exists on a flex
+    body).
+    """
+    return settings.mount not in ("standing", "planar")
+
+
+ROD_HALF_LENGTH = 0.08  # planar rod: 16 cm of vertical wooden rod
+# The presenting hand parks this far ahead (+X) of the grasp pose while the
+# arm packs, then carries the object in during REACH (paper Fig. 3A: the
+# rod only meets the arm after the tip spiral has formed).
+HAND_PARK_OFFSET = 0.12
 
 
 def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) -> None:
     if settings.object_kind == "none":
         return
     radius = settings.object_size_mm * MM * 0.5
-    x = settings.object_x + PEDESTAL_FAR_OFFSET  # stage waits outside the pack sweep
-    top = settings.pedestal_height
+    if settings.mount == "planar":
+        if settings.object_kind == "soft_sphere":
+            _add_floor_soft_object(worldbody, settings, radius)
+        else:
+            _add_held_object(worldbody, root, settings, radius)
+        return
+    if not _uses_stage(settings):
+        if settings.object_kind == "soft_sphere":
+            _add_floor_soft_object(worldbody, settings, radius)
+        else:
+            _add_string_object(worldbody, root, settings, radius)
+        return
+    x = settings.object_x + pedestal_far_offset(settings.mount)  # parked clear of the arm
+    # Platform height that puts the object center at the grasp height for
+    # any size. Clamped so the pedestal stays a real cylinder; objects with
+    # radius > ~0.09 m then present above grasp_center_z, a limit of the
+    # rig rather than a tuning knob.
+    top = max(0.01, settings.grasp_center_z - radius - 0.001)
 
     # Kinematic rail stage: a slide joint with a position servo, so the
     # platform has a real velocity and friction carries the object with it
@@ -250,7 +318,8 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
 
     if settings.object_kind == "soft_sphere":
         # MuJoCo 3 flex deformable: a tetrahedral ellipsoid with linear
-        # elasticity. count/spacing span the requested diameter.
+        # elasticity. count/spacing span the requested diameter; the vertex
+        # radius must stay below the spacing for small objects.
         count = 6
         spacing = (2 * radius) / (count - 1)
         flexcomp = ET.SubElement(
@@ -260,6 +329,7 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
             type="ellipsoid",
             count=_fmt(count, count, count),
             spacing=_fmt(spacing, spacing, spacing),
+            radius=_fmt(min(0.005, spacing * 0.45)),
             pos=_fmt(x, 0, top + radius + 0.001),
             dim="3",
             mass=_fmt(settings.object_mass),
@@ -296,3 +366,133 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
         ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
     elif settings.object_kind == "cylinder":
         ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, radius), **common)
+
+
+def _add_held_object(
+    worldbody: ET.Element, root: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Rigid object carried into the planar curl by "hand" (paper Fig. 3A).
+
+    The hand is a mocap body welded to the object: it parks ahead of the
+    arm (+X) while the tip spiral packs, then ``SpiRobSim`` slides it to
+    (object_x, object_y) during REACH — exactly the experimenter's hand
+    bringing the rod to the arm in the figure. ``SpiRobSim.release_object``
+    disables the weld during HOLDING, so the wrap alone must carry the
+    object's weight afterwards. A cylinder is the paper's vertical wooden
+    rod; sphere/box are held just above the table at the curl height.
+    """
+    x, y = settings.object_x + HAND_PARK_OFFSET, settings.object_y
+    if settings.object_kind == "cylinder":
+        z = ROD_HALF_LENGTH + 0.002
+    else:
+        z = radius + 0.002
+    hand = ET.SubElement(
+        worldbody, "body", name="hand", mocap="true", pos=_fmt(x, y, z)
+    )
+    # Visual-only marker so the presenting hand is visible in the viewer.
+    ET.SubElement(
+        hand,
+        "geom",
+        type="sphere",
+        size="0.008",
+        contype="0",
+        conaffinity="0",
+        rgba="0.9 0.75 0.6 0.5",
+    )
+    body = ET.SubElement(worldbody, "body", name="object", pos=_fmt(x, y, z))
+    ET.SubElement(body, "freejoint", name="object_free")
+    common = {
+        "name": "object_geom",
+        "mass": _fmt(settings.object_mass),
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
+        "rgba": "0.78 0.62 0.42 1",
+    }
+    if settings.object_kind == "sphere":
+        ET.SubElement(body, "geom", type="sphere", size=_fmt(radius), **common)
+    elif settings.object_kind == "box":
+        ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
+    elif settings.object_kind == "cylinder":
+        ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, ROD_HALF_LENGTH), **common)
+
+    equality = ET.SubElement(root, "equality")
+    # A zero relpose quat means "use the qpos0 relative pose": the object
+    # rigidly follows the hand until the weld is released.
+    ET.SubElement(equality, "weld", name="hand_weld", body1="hand", body2="object")
+
+
+def _add_floor_soft_object(
+    worldbody: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Soft object resting on the floor beside the arm (Fig. 5C table)."""
+    count = 6
+    spacing = (2 * radius) / (count - 1)
+    flexcomp = ET.SubElement(
+        worldbody,
+        "flexcomp",
+        name="object",
+        type="ellipsoid",
+        count=_fmt(count, count, count),
+        spacing=_fmt(spacing, spacing, spacing),
+        radius=_fmt(min(0.005, spacing * 0.45)),
+        pos=_fmt(settings.object_x, settings.object_y, radius + 0.002),
+        dim="3",
+        mass=_fmt(settings.object_mass),
+        rgba="0.3 0.62 0.9 1",
+    )
+    ET.SubElement(
+        flexcomp,
+        "elasticity",
+        young=_fmt(settings.object_young),
+        poisson=_fmt(settings.object_poisson),
+    )
+    ET.SubElement(flexcomp, "contact", selfcollide="none", internal="false")
+
+
+def _add_string_object(
+    worldbody: ET.Element, root: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Rigid object hanging from an inextensible string at the grasp point.
+
+    A limited spatial tendon from a world anchor to the object's center acts
+    as the presenting hand: it carries the weight while the arm closes, and
+    ``SpiRobSim.release_string`` slackens it so the wrap alone must hold.
+    MuJoCo tendons do not collide with geoms, so the string passing through
+    the wrap region is force-free (a deliberate modeling artifact).
+    """
+    x, z = settings.object_x, settings.grasp_center_z
+    ET.SubElement(
+        worldbody,
+        "site",
+        name="string_anchor",
+        pos=_fmt(x, 0, z + STRING_ANCHOR_DROP),
+    )
+    body = ET.SubElement(worldbody, "body", name="object", pos=_fmt(x, 0, z))
+    ET.SubElement(body, "freejoint", name="object_free")
+    ET.SubElement(body, "site", name="object_center")
+    common = {
+        "name": "object_geom",
+        "mass": _fmt(settings.object_mass),
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
+        "rgba": "0.3 0.62 0.9 1",
+    }
+    if settings.object_kind == "sphere":
+        ET.SubElement(body, "geom", type="sphere", size=_fmt(radius), **common)
+    elif settings.object_kind == "box":
+        ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
+    elif settings.object_kind == "cylinder":
+        ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, radius), **common)
+
+    tendon = ET.SubElement(root, "tendon")
+    string = ET.SubElement(
+        tendon,
+        "spatial",
+        name="string",
+        limited="true",
+        range=_fmt(0, STRING_ANCHOR_DROP),
+        width="0.0003",
+        rgba="0.8 0.8 0.85 1",
+    )
+    ET.SubElement(string, "site", site="string_anchor")
+    ET.SubElement(string, "site", site="object_center")

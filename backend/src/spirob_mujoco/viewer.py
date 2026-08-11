@@ -12,16 +12,16 @@ import time
 
 import mujoco.viewer
 
-from .settings import OBJECT_KINDS, SimSettings
+from .settings import MOUNTS, OBJECT_KINDS, SimSettings
 from .simulation import SpiRobSim
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SpiRob MuJoCo viewer")
-    parser.add_argument("--object", choices=OBJECT_KINDS, default="sphere")
-    parser.add_argument("--size", type=float, default=52.0, help="object size [mm]")
-    parser.add_argument("--mass", type=float, default=0.045, help="object mass [kg]")
-    parser.add_argument("--mount", choices=("hanging", "horizontal"), default="hanging")
+    parser.add_argument("--object", choices=OBJECT_KINDS, default="cylinder")
+    parser.add_argument("--size", type=float, default=30.0, help="object size (diameter) [mm]")
+    parser.add_argument("--mass", type=float, default=0.07, help="object mass [kg]")
+    parser.add_argument("--mount", choices=MOUNTS, default="planar")
     parser.add_argument("--stiffness", type=float, default=0.7, help="base joint stiffness [Nm/rad]")
     parser.add_argument("--young", type=float, default=2.0e4, help="soft object Young's modulus [Pa]")
     parser.add_argument("--grasp", action="store_true", help="run the paper's auto-grasp sequence")
