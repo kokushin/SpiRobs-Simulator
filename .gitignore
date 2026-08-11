@@ -1,6 +1,12 @@
 # Dependencies
 node_modules/
 
+# Python (backend)
+.venv/
+__pycache__/
+.pytest_cache/
+MUJOCO_LOG.TXT
+
 # Build output
 dist/
 dist-ssr/
