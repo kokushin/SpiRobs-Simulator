@@ -1,79 +1,65 @@
-"""Auto-grasp tension schedule for the MuJoCo backend.
+"""Auto-grasp tension schedule: the paper's antagonistic sequence.
 
-This is NOT the schedule of the web simulator: that one drove scripted
-surface-following constraints, so its tensions never had to produce the
-wrap physically. Here the wrap must emerge from tendon and contact
-mechanics, which changes the working ranges completely (verified by
-parameter sweeps):
+Faithful port of ``autoGraspCommand`` from ``src/physics.ts``, which encodes
+the SpiRobs paper's Fig. 3A sequence with one packing cable against the
+vector sum of the other two:
 
-- packing beyond ~2 N retracts the whole coil toward the base and peels
-  it off the presented object, so the wrap forms at low tension;
-- the presented object is released while a fading viscous damper absorbs
-  the stored contact energy (instant release catapults rigid objects).
+  packing    t < 1.2 s   ramp the packing cable to 6 N: the arm packs
+                          into a logarithmic spiral from the tip
+  reaching   t < 4.4 s   raise the opposing pair to 5.82 N: capstan
+                          attenuation lets the base unwind while the
+                          packed tip spiral survives, extending the arm
+                          toward the object
+  wrapping   t < 8.4 s   relax packing 6 -> 5.2 N with the opposing pair
+                          held: the spiral climbs the object surface
+  grasping   t < 10.2 s  raise the opposing pair to 9 N for friction
+                          closure
+  holding    afterwards  hold 5.2 / 9 N
 
-Phases:
-  packing   0..4 s     settle for 1 s, then ramp cable 0 -> WRAP_TENSION
-  wrapping  4..4.6 s   short hold at the wrap peak (longer holds let the
-                       coil creep over the object surface and peel off)
-  grasping  4.6..6.6 s fixture released; damper fades out
-  holding   6.6 s..    constant tension, object fully dynamic
-
-Known limitation: after release the wrap does not yet carry the object's
-full weight — the distal joints are too soft under the r^3 similarity law
-to close the coil mouth against a 45 g load, so the object settles out of
-the coil. Wrap formation and the non-violent release are the validated
-parts; sustained holding needs either more wrap turns (smaller objects),
-capstan-graded tendons, or a hanging mount, and is future work.
+Whether the grasp succeeds is up to the physics — the point of this
+backend is that "this object is too heavy for this tension plan" is an
+observable outcome, not a scripted one.
 """
 
 from dataclasses import dataclass
 
 
-PHASES = ("packing", "wrapping", "grasping", "holding")
-
-WRAP_TENSION = 1.8
-SETTLE_END = 1.0
-PACK_END = 4.0
-WRAP_END = 4.6
-RELEASE_END = 6.6
+PHASES = ("packing", "reaching", "wrapping", "grasping", "holding")
 
 
 @dataclass(frozen=True)
 class GraspCommand:
     phase: str
     cable_forces: tuple[float, float, float]
-    release_target: bool
-    # 1 -> full fixture assist, 0 -> object fully free. Fades during the
-    # grasping phase so the load transfers to the wrap gradually.
-    fixture_assist: float
 
 
 def auto_grasp_command(elapsed_seconds: float, primary_cable: int = 0) -> GraspCommand:
     t = max(0.0, elapsed_seconds)
 
-    if t < PACK_END:
+    if t < 1.2:
         phase = "packing"
-        ramp = max(0.0, t - SETTLE_END) / (PACK_END - SETTLE_END)
-        packing = WRAP_TENSION * ramp
-        assist = 1.0
-    elif t < WRAP_END:
+        packing = 6.0 * (t / 1.2)
+        opposing = 0.0
+    elif t < 4.4:
+        phase = "reaching"
+        progress = (t - 1.2) / 3.2
+        packing = 6.0
+        opposing = 5.82 * progress
+    elif t < 8.4:
         phase = "wrapping"
-        packing = WRAP_TENSION
-        assist = 1.0
-    elif t < RELEASE_END:
+        progress = (t - 4.4) / 4.0
+        packing = 6.0 - 0.8 * progress
+        opposing = 5.82
+    elif t < 10.2:
         phase = "grasping"
-        packing = WRAP_TENSION
-        assist = 1.0 - (t - WRAP_END) / (RELEASE_END - WRAP_END)
+        progress = (t - 8.4) / 1.8
+        packing = 5.2
+        opposing = 5.82 + 3.18 * progress
     else:
         phase = "holding"
-        packing = WRAP_TENSION
-        assist = 0.0
+        packing = 5.2
+        opposing = 9.0
 
-    forces = [0.0, 0.0, 0.0]
+    forces = [opposing, opposing, opposing]
     forces[primary_cable % 3] = packing
-    return GraspCommand(
-        phase=phase,
-        cable_forces=(forces[0], forces[1], forces[2]),
-        release_target=t >= WRAP_END,
-        fixture_assist=assist,
-    )
+    return GraspCommand(phase=phase, cable_forces=(forces[0], forces[1], forces[2]))

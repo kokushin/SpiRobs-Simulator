@@ -19,16 +19,22 @@ from math import cos, radians, sin
 from .settings import SimSettings
 from .unit_data import MM, UNIT_COUNT, UNIT_DATA, along_m, cable_radius_m, unit_volumes
 
-ROOT_POS = (-0.06, 0.0, 0.2)
-OBJECT_X = 0.08
-# Presentation fixture pose for AUTO GRASP (MuJoCo Z-up). The web
-# simulator's pose (-0.03, 0, 0.06 here) was tuned for its scripted wrap;
-# with emergent physics the wrap forms where the free-space coil path runs,
-# found by sweeping presentation poses.
-FIXTURE_POS = (0.0, 0.0, 0.10)
+# Base pose per mount. Hanging: arm points straight down (+X body axis
+# rotated onto -Z) from high enough that the straight arm tip clears the
+# pedestal; the packing cable 0 then curls the spiral toward -X.
+MOUNT_POSE = {
+    "horizontal": {"pos": (-0.06, 0.0, 0.2), "quat": (1.0, 0.0, 0.0, 0.0)},
+    "hanging": {"pos": (0.0, 0.0, 0.32), "quat": (0.70710678, 0.0, 0.70710678, 0.0)},
+}
 JOINT_RANGE_DEG = 28.8  # 30 deg paper limit x 0.96, same margin as the rod solver
 CABLE_PHASES_DEG = (0.0, 120.0, 240.0)
 MAX_CABLE_FORCE = 15.0
+# The object rests on a kinematic pedestal stage (a physical test rig, not
+# a magic fixture): it waits outside the packing sweep, slides in during
+# the REACH phase carrying the object by friction, and retracts during
+# HOLDING so the wrap alone must carry the weight.
+PEDESTAL_RADIUS = 0.016
+PEDESTAL_FAR_OFFSET = -0.13
 
 
 def _fmt(*values: float) -> str:
@@ -60,7 +66,10 @@ def build_mjcf(settings: SimSettings) -> str:
     # young 5e3..2e4 Pa; 2 ms blows up regardless of integrator).
     timestep = settings.timestep
     if settings.object_kind == "soft_sphere":
-        timestep = min(timestep, 5e-4)
+        # Lighter vertices raise the elastic eigenfrequencies, so the stable
+        # step shrinks with sqrt(mass).
+        soft_step = 5e-4 * (settings.object_mass / 0.045) ** 0.5
+        timestep = min(timestep, max(2e-4, soft_step))
     ET.SubElement(
         root,
         "option",
@@ -96,7 +105,14 @@ def build_mjcf(settings: SimSettings) -> str:
     parent = worldbody
     for i, (_, length, h, w) in enumerate(UNIT_DATA):
         if i == 0:
-            body = ET.SubElement(parent, "body", name="unit00", pos=_fmt(*ROOT_POS))
+            pose = MOUNT_POSE[settings.mount]
+            body = ET.SubElement(
+                parent,
+                "body",
+                name="unit00",
+                pos=_fmt(*pose["pos"]),
+                quat=_fmt(*pose["quat"]),
+            )
         else:
             separation = along_m(i) - along_m(i - 1)
             body = ET.SubElement(parent, "body", name=f"unit{i:02d}", pos=_fmt(separation, 0, 0))
@@ -157,28 +173,44 @@ def build_mjcf(settings: SimSettings) -> str:
             body2=f"unit{i:02d}",
         )
 
+    # Each cable is split into per-joint tendon segments so the controller
+    # can impose the capstan law T_i = T0 * exp(-mu * sum |dtheta|): a single
+    # continuous MuJoCo tendon equalizes tension along its whole path, which
+    # erases exactly the pack/unwind asymmetry the paper's antagonistic
+    # grasp sequence depends on. Actuator order: cable-major, then joint.
     tendon = ET.SubElement(root, "tendon")
-    for c in range(3):
-        spatial = ET.SubElement(
-            tendon,
-            "spatial",
-            name=f"cable{c}",
-            width="0.0004",
-            rgba="0.85 0.4 0.15 1",
-            frictionloss=_fmt(settings.cable_friction),
-        )
-        for i in range(UNIT_COUNT):
-            ET.SubElement(spatial, "site", site=f"u{i:02d}_c{c}")
-
     actuator = ET.SubElement(root, "actuator")
     for c in range(3):
+        for i in range(1, UNIT_COUNT):
+            spatial = ET.SubElement(
+                tendon,
+                "spatial",
+                name=f"cable{c}_seg{i:02d}",
+                width="0.0004",
+                rgba="0.85 0.4 0.15 1",
+            )
+            ET.SubElement(spatial, "site", site=f"u{i - 1:02d}_c{c}")
+            ET.SubElement(spatial, "site", site=f"u{i:02d}_c{c}")
+            ET.SubElement(
+                actuator,
+                "motor",
+                name=f"cable{c}_seg{i:02d}_motor",
+                tendon=f"cable{c}_seg{i:02d}",
+                gear="-1",
+                ctrlrange=_fmt(0, MAX_CABLE_FORCE),
+            )
+
+    if settings.object_kind != "none":
+        # Stage servo (always the LAST actuator; the capstan controller
+        # relies on the cable motors occupying ctrl[0:57]).
         ET.SubElement(
             actuator,
-            "motor",
-            name=f"cable{c}_motor",
-            tendon=f"cable{c}",
-            gear="-1",
-            ctrlrange=_fmt(0, MAX_CABLE_FORCE),
+            "position",
+            name="stage_servo",
+            joint="stage_x",
+            kp="400",
+            kv="60",
+            ctrlrange=_fmt(-0.05, 0.2),
         )
 
     return ET.tostring(root, encoding="unicode")
@@ -188,6 +220,33 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
     if settings.object_kind == "none":
         return
     radius = settings.object_size_mm * MM * 0.5
+    x = settings.object_x + PEDESTAL_FAR_OFFSET  # stage waits outside the pack sweep
+    top = settings.pedestal_height
+
+    # Kinematic rail stage: a slide joint with a position servo, so the
+    # platform has a real velocity and friction carries the object with it
+    # (a mocap body reports zero velocity and objects slip off).
+    stage = ET.SubElement(
+        worldbody,
+        "body",
+        name="pedestal",
+        pos=_fmt(x, 0, top * 0.5),
+    )
+    ET.SubElement(stage, "joint", name="stage_x", type="slide", axis="1 0 0", damping="8")
+    # condim 6 + rolling friction so a rigid ball is carried by the moving
+    # platform instead of rolling off the back (soft balls are carried by
+    # their deformed contact patch either way).
+    ET.SubElement(
+        stage,
+        "geom",
+        name="pedestal_geom",
+        type="cylinder",
+        size=_fmt(PEDESTAL_RADIUS, top * 0.5),
+        mass="0.5",
+        condim="6",
+        friction=_fmt(0.92, 0.02, 0.02),
+        rgba="0.5 0.48 0.45 1",
+    )
 
     if settings.object_kind == "soft_sphere":
         # MuJoCo 3 flex deformable: a tetrahedral ellipsoid with linear
@@ -201,7 +260,7 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
             type="ellipsoid",
             count=_fmt(count, count, count),
             spacing=_fmt(spacing, spacing, spacing),
-            pos=_fmt(OBJECT_X, 0, radius + 0.002),
+            pos=_fmt(x, 0, top + radius + 0.001),
             dim="3",
             mass=_fmt(settings.object_mass),
             rgba="0.3 0.62 0.9 1",
@@ -221,27 +280,14 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
         worldbody,
         "body",
         name="object",
-        pos=_fmt(OBJECT_X, 0, radius),
+        pos=_fmt(x, 0, top + radius + 0.001),
     )
     ET.SubElement(body, "freejoint", name="object_free")
-    # AUTO GRASP presentation fixture: a mocap body the object is welded to
-    # while the wrap forms, released when HOLDING starts (mirrors the
-    # KINEMATIC->DYNAMIC switch of the web simulator).
-    ET.SubElement(worldbody, "body", name="fixture", mocap="true", pos=_fmt(*FIXTURE_POS))
-    equality = ET.SubElement(root, "equality")
-    ET.SubElement(
-        equality,
-        "weld",
-        name="fixture_weld",
-        body1="fixture",
-        body2="object",
-        active="false",
-        relpose="0 0 0 1 0 0 0",
-    )
     common = {
         "name": "object_geom",
         "mass": _fmt(settings.object_mass),
-        "friction": _fmt(0.92, 0.005, 0.0001),
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
         "rgba": "0.3 0.62 0.9 1",
     }
     if settings.object_kind == "sphere":

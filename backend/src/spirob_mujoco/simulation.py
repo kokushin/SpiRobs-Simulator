@@ -1,32 +1,37 @@
 """Stepping wrapper around the MJCF model.
 
 Owns the MjModel/MjData pair and exposes the same knobs the web UI uses:
-cable tensions, auto-grasp schedule, reset, and a JSON-serializable state
-snapshot for the transport layer.
+cable tensions, the paper's auto-grasp schedule, reset, and a
+JSON-serializable state snapshot for the transport layer.
 
-Auto grasp reproduces the web simulator's test-fixture flow: the object is
-presented at a repeatable pose while the wrap forms (rigid objects via a
-weld to a mocap body, soft objects via per-vertex PD holding forces), then
-released to full dynamics when the schedule enters HOLDING.
+Cable mechanics: each cable is 19 tendon segments (one per joint), and the
+controller distributes the commanded motor tension along them with the
+capstan law ``T_i = T0 * exp(-mu * sum_{j<i} |dtheta_j|)`` recomputed every
+substep from the current joint angles — the same attenuation model as the
+web simulator, but acting inside a full contact simulation. No artificial
+staging forces exist; the object simply rests on its pedestal.
 """
 
 import mujoco
 import numpy as np
 
 from .grasp import auto_grasp_command
-from .model import FIXTURE_POS, build_mjcf
+from .model import PEDESTAL_FAR_OFFSET, build_mjcf
 from .settings import SimSettings
 from .unit_data import UNIT_COUNT, UNIT_DATA
 
-# Acceleration-level gains for the soft-object fixture: only the center of
-# mass is held (critically damped, kd = 2 sqrt(kp)) so the ball can deform
-# and let the coil conform around it, unlike a rigid weld.
-SOFT_STAGE_KP = 800.0
-SOFT_STAGE_KD = 56.0
-# Viscous damper applied to the object while the fixture assist fades out
-# after release; absorbs stored contact energy that would otherwise
-# catapult the object (units: 1/s, scaled by mass).
-RELEASE_DAMPING = 30.0
+# Pedestal stage timeline, relative to auto-grasp start [s]: slide in
+# during REACH, hold through WRAP/GRASP, retract shortly into HOLDING so
+# the wrap alone must carry the object.
+STAGE_IN_START = 1.2
+STAGE_IN_END = 4.4
+STAGE_OUT_START = 11.2
+STAGE_OUT_END = 13.2
+
+
+def _smoothstep(u: float) -> float:
+    u = min(1.0, max(0.0, u))
+    return u * u * (3.0 - 2.0 * u)
 
 
 class SpiRobSim:
@@ -44,37 +49,35 @@ class SpiRobSim:
             for i in range(UNIT_COUNT)
         }
 
-        # Rigid object bookkeeping (ids are -1 when absent).
+        # Joint hinge-pair qpos addresses, ordered by unit (i = 1..19).
+        self._joint_qposadr = np.array(
+            [
+                self.model.jnt_qposadr[
+                    mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"u{i:02d}_y")
+                ]
+                for i in range(1, UNIT_COUNT)
+            ]
+        )
+
         self._object_body_id = body_id("object")
         self._object_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "object_geom"
         )
-        self._weld_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, "fixture_weld"
-        )
-        fixture_body = body_id("fixture")
-        self._fixture_mocap_id = (
-            self.model.body_mocapid[fixture_body] if fixture_body >= 0 else -1
-        )
-        object_joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "object_free")
-        self._object_qposadr = self.model.jnt_qposadr[object_joint] if object_joint >= 0 else -1
-        self._object_dofadr = self.model.jnt_dofadr[object_joint] if object_joint >= 0 else -1
-
-        # Soft object bookkeeping.
         self._flex_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_FLEX, "object")
-        if self._flex_id >= 0:
-            self._flex_vert_bodies = np.array(self.model.flex_vertbodyid, dtype=int)
-            joints = self.model.body_jntadr[self._flex_vert_bodies]
-            self._flex_qposadr = self.model.jnt_qposadr[joints]
-            self._flex_dofadr = self.model.jnt_dofadr[joints]
-        else:
-            self._flex_vert_bodies = np.empty(0, dtype=int)
-        self._fixture = np.array(self.settings.fixture_pos or FIXTURE_POS)
 
-        self._staged = False
+        # Stage servo: last actuator; its ctrl is the slide-joint offset
+        # relative to the far parking position.
+        self._stage_ctrl_index = (
+            self.model.nu - 1
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "stage_servo") >= 0
+            else -1
+        )
+        self._stage_travel = -PEDESTAL_FAR_OFFSET  # far -> grasp point distance
+
         self.grasp_start_time: float | None = None
         self.grasp_primary_cable = 0
         self.grasp_phase: str | None = None
+        self._base_forces = np.zeros(3)
         mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------------------------ control
@@ -84,7 +87,6 @@ class SpiRobSim:
         web UI does."""
         self.grasp_start_time = None
         self.grasp_phase = None
-        self._release_fixture()
         self._apply_forces(forces)
 
     def _apply_forces(self, forces) -> None:
@@ -92,106 +94,65 @@ class SpiRobSim:
         if values.shape != (3,):
             raise ValueError("cable forces must have exactly 3 entries")
         self.settings.cable_forces = values.tolist()
-        self.data.ctrl[:3] = values
+        self._base_forces = values
+
+    def _apply_capstan(self) -> None:
+        """Distribute motor tensions along the segments with the capstan law.
+
+        The accumulated turn for the joint driving unit i sums the bends of
+        joints 2..i-1 (matching the web solver, which never attenuates a
+        straight robot).
+        """
+        qy = self.data.qpos[self._joint_qposadr]
+        qz = self.data.qpos[self._joint_qposadr + 1]
+        bend = np.hypot(qy, qz)
+        accumulated = np.concatenate(([0.0], np.cumsum(bend[:-1])))
+        attenuation = np.exp(-self.settings.cable_friction * accumulated)
+        segments = UNIT_COUNT - 1
+        for c in range(3):
+            self.data.ctrl[c * segments : (c + 1) * segments] = (
+                self._base_forces[c] * attenuation
+            )
 
     def start_auto_grasp(self, primary_cable: int = 0) -> None:
         self.grasp_start_time = self.data.time
         self.grasp_primary_cable = primary_cable % 3
         self.grasp_phase = "packing"
-        self._stage_fixture()
 
     def reset(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
-        self._staged = False
         self.grasp_start_time = None
         self.grasp_phase = None
         self._apply_forces([0.0, 0.0, 0.0])
         mujoco.mj_forward(self.model, self.data)
 
-    # ------------------------------------------------------------------ fixture
-
-    def _stage_fixture(self) -> None:
-        fixture = self._fixture
-        if self._object_body_id >= 0 and self._weld_id >= 0:
-            adr = self._object_qposadr
-            self.data.qpos[adr : adr + 3] = fixture
-            self.data.qpos[adr + 3 : adr + 7] = (1.0, 0.0, 0.0, 0.0)
-            self.data.qvel[self._object_dofadr : self._object_dofadr + 6] = 0.0
-            self.data.mocap_pos[self._fixture_mocap_id] = fixture
-            self.data.mocap_quat[self._fixture_mocap_id] = (1.0, 0.0, 0.0, 0.0)
-            self.data.eq_active[self._weld_id] = 1
-            self._staged = True
-        elif self._flex_id >= 0:
-            center = self.data.flexvert_xpos.mean(axis=0)
-            delta = fixture - center
-            for adr, dof in zip(self._flex_qposadr, self._flex_dofadr):
-                self.data.qpos[adr : adr + 3] += delta
-                self.data.qvel[dof : dof + 3] = 0.0
-            mujoco.mj_forward(self.model, self.data)
-            self._staged = True
-
-    def _release_fixture(self) -> None:
-        """Fully free the object: weld off, all assist forces cleared."""
-        if self._weld_id >= 0:
-            self.data.eq_active[self._weld_id] = 0
-        if self._flex_id >= 0:
-            self.data.xfrc_applied[self._flex_vert_bodies] = 0.0
-        if self._object_body_id >= 0:
-            self.data.xfrc_applied[self._object_body_id] = 0.0
-        self._staged = False
-
-    def _apply_fixture_assist(self, assist: float) -> None:
-        """Fixture behavior while the auto-grasp schedule runs.
-
-        assist == 1 while the wrap forms: rigid objects are held by the weld
-        (nothing to do here), soft objects by a center-of-mass spring. As
-        assist fades after release the object only feels a shrinking viscous
-        damper, so the wrap takes the load gradually.
-        """
-        released = assist < 1.0
-        if released and self._weld_id >= 0 and self.data.eq_active[self._weld_id]:
-            self.data.eq_active[self._weld_id] = 0
-
-        if self._flex_id >= 0:
-            masses = self.model.body_mass[self._flex_vert_bodies][:, None]
-            dof_index = self._flex_dofadr[:, None] + np.arange(3)
-            velocities = self.data.qvel[dof_index]
-            if not released:
-                total = masses.sum()
-                com = (self.data.xpos[self._flex_vert_bodies] * masses).sum(axis=0) / total
-                vcom = (velocities * masses).sum(axis=0) / total
-                acceleration = (
-                    SOFT_STAGE_KP * (self._fixture - com)
-                    - SOFT_STAGE_KD * vcom
-                    - self.model.opt.gravity
-                )
-                self.data.xfrc_applied[self._flex_vert_bodies, :3] = masses * acceleration
-            else:
-                self.data.xfrc_applied[self._flex_vert_bodies, :3] = (
-                    -assist * RELEASE_DAMPING * masses * velocities
-                )
-        elif self._object_body_id >= 0 and released:
-            velocity = self.data.qvel[self._object_dofadr : self._object_dofadr + 3]
-            mass = self.model.body_mass[self._object_body_id]
-            self.data.xfrc_applied[self._object_body_id, :3] = (
-                -assist * RELEASE_DAMPING * mass * velocity
-            )
-
     # ------------------------------------------------------------------ stepping
+
+    def _move_stage(self, elapsed: float) -> None:
+        if self._stage_ctrl_index < 0:
+            return
+        if elapsed < STAGE_IN_START:
+            u = 0.0
+        elif elapsed < STAGE_IN_END:
+            u = _smoothstep((elapsed - STAGE_IN_START) / (STAGE_IN_END - STAGE_IN_START))
+        elif elapsed < STAGE_OUT_START:
+            u = 1.0
+        else:
+            u = 1.0 - _smoothstep(
+                (elapsed - STAGE_OUT_START) / (STAGE_OUT_END - STAGE_OUT_START)
+            )
+        self.data.ctrl[self._stage_ctrl_index] = self._stage_travel * u
 
     def step(self, duration: float) -> None:
         steps = max(1, round(duration / self.model.opt.timestep))
         for _ in range(steps):
             if self.grasp_start_time is not None:
-                command = auto_grasp_command(
-                    self.data.time - self.grasp_start_time, self.grasp_primary_cable
-                )
+                elapsed = self.data.time - self.grasp_start_time
+                command = auto_grasp_command(elapsed, self.grasp_primary_cable)
                 self.grasp_phase = command.phase
                 self._apply_forces(command.cable_forces)
-                if self._staged and command.fixture_assist <= 0.0:
-                    self._release_fixture()
-                elif self._staged:
-                    self._apply_fixture_assist(command.fixture_assist)
+                self._move_stage(elapsed)
+            self._apply_capstan()
             mujoco.mj_step(self.model, self.data)
 
     # ------------------------------------------------------------------ state
@@ -226,15 +187,15 @@ class SpiRobSim:
                     "quat": self.data.xquat[bid].tolist(),
                 }
             )
-        tensions = (-self.data.actuator_force[:3]).clip(min=0.0).tolist()
+        segments = UNIT_COUNT - 1
+        tip_tensions = [float(self.data.ctrl[c * segments + segments - 1]) for c in range(3)]
 
         state: dict = {
             "time": self.data.time,
             "units": units,
             "cableForces": list(self.settings.cable_forces),
-            "cableTensions": tensions,
+            "cableTipTensions": tip_tensions,
             "graspPhase": self.grasp_phase,
-            "objectStaged": self._staged,
             "contactingUnits": self.contacting_units(),
         }
 
@@ -258,6 +219,7 @@ class SpiRobSim:
             "timestep": self.model.opt.timestep,
             "objectKind": self.settings.object_kind,
             "objectSizeMm": self.settings.object_size_mm,
+            "objectMassKg": self.settings.object_mass,
         }
         if self._flex_id >= 0:
             meta["flexVertexCount"] = int(self.model.nflexvert)

@@ -21,12 +21,22 @@ def main() -> None:
     parser.add_argument("--object", choices=OBJECT_KINDS, default="sphere")
     parser.add_argument("--size", type=float, default=52.0, help="object size [mm]")
     parser.add_argument("--mass", type=float, default=0.045, help="object mass [kg]")
-    parser.add_argument("--grasp", action="store_true", help="run the auto-grasp schedule")
+    parser.add_argument("--mount", choices=("hanging", "horizontal"), default="hanging")
+    parser.add_argument("--stiffness", type=float, default=0.7, help="base joint stiffness [Nm/rad]")
+    parser.add_argument("--young", type=float, default=2.0e4, help="soft object Young's modulus [Pa]")
+    parser.add_argument("--grasp", action="store_true", help="run the paper's auto-grasp sequence")
     parser.add_argument("--forces", type=float, nargs=3, default=None, metavar=("C0", "C1", "C2"))
     args = parser.parse_args()
 
     sim = SpiRobSim(
-        SimSettings(object_kind=args.object, object_size_mm=args.size, object_mass=args.mass)
+        SimSettings(
+            object_kind=args.object,
+            object_size_mm=args.size,
+            object_mass=args.mass,
+            mount=args.mount,
+            stiffness=args.stiffness,
+            object_young=args.young,
+        )
     )
     if args.grasp:
         sim.start_auto_grasp()
