@@ -5,6 +5,7 @@ Usage:
     uv run spirob-viewer --grasp               # run the auto-grasp schedule
     uv run spirob-viewer --object soft_sphere  # elastic object (MuJoCo flex)
     uv run spirob-viewer --forces 6 0 0        # constant cable tensions [N]
+    uv run spirob-viewer --mount array --grasp # 3-arm gantry transports the rod
 """
 
 import argparse
@@ -22,6 +23,12 @@ def main() -> None:
     parser.add_argument("--size", type=float, default=30.0, help="object size (diameter) [mm]")
     parser.add_argument("--mass", type=float, default=0.07, help="object mass [kg]")
     parser.add_argument("--mount", choices=MOUNTS, default="planar")
+    parser.add_argument(
+        "--arms",
+        type=int,
+        default=None,
+        help="arm count on the gantry ring (array mount only; default 3)",
+    )
     parser.add_argument("--stiffness", type=float, default=0.7, help="base joint stiffness [Nm/rad]")
     parser.add_argument("--young", type=float, default=2.0e4, help="soft object Young's modulus [Pa]")
     parser.add_argument("--grasp", action="store_true", help="run the paper's auto-grasp sequence")
@@ -34,6 +41,7 @@ def main() -> None:
             object_size_mm=args.size,
             object_mass=args.mass,
             mount=args.mount,
+            arm_count=args.arms,
             stiffness=args.stiffness,
             object_young=args.young,
         )

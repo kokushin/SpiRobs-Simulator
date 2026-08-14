@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 
 OBJECT_KINDS = ("sphere", "box", "cylinder", "soft_sphere", "none")
-MOUNTS = ("planar", "hanging", "horizontal", "standing")
+MOUNTS = ("planar", "hanging", "horizontal", "standing", "array")
 
 
 # Default object presentation pose per mount: (object_x, grasp_center_z).
@@ -42,7 +42,10 @@ class SimSettings:
     # horizontal plane on a smooth table (gravity perpendicular to the
     # bending plane) and a vertical wooden rod is held into the curl by
     # hand. 'planar' reproduces that arrangement and is the faithful
-    # default. 'standing' / 'hanging' / 'horizontal' remain for exploration
+    # default. 'array' is the paper's multi-SpiRob gripper (Fig. 6): several
+    # arms hang from a gantry ring, curl inward simultaneously so their
+    # radial push forces cancel, and the gantry transports the entangled
+    # object. 'standing' / 'hanging' / 'horizontal' remain for exploration
     # ('horizontal' matches the web simulator's default mount).
     mount: str = "planar"
     cable_forces: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
@@ -85,12 +88,37 @@ class SimSettings:
     object_x: float | None = None
     object_y: float | None = None
     grasp_center_z: float | None = None
+    # Array mount only: number of arms on the gantry ring, ring radius from
+    # the gantry axis to each arm's base center [m], and the height of the
+    # base ring above the floor [m]. Calibrated by sweep for the default
+    # 30 mm rod under the Fig. 6B pack-approach-drape sequence: at 0.05 the
+    # packed spirals descend clear of the rod and the three drapes engage
+    # it symmetrically. Tighter rings (0.04) land the packed spirals on
+    # the rod's top during the approach and the asymmetric bumps knock it
+    # over — the paper's push-away problem, reproduced.
+    arm_count: int | None = None
+    ring_radius: float = 0.05
+    base_height: float = 0.20
 
     def __post_init__(self) -> None:
         if self.object_kind not in OBJECT_KINDS:
             raise ValueError(f"unknown object_kind: {self.object_kind!r}")
         if self.mount not in MOUNTS:
             raise ValueError(f"unknown mount: {self.mount!r}")
+        if self.arm_count is None:
+            self.arm_count = 3 if self.mount == "array" else 1
+        if self.mount != "array" and self.arm_count != 1:
+            raise ValueError("multiple arms are only supported on the array mount")
+        if self.mount == "array":
+            # The object stands free at the gantry axis (no hand, no rig):
+            # whether the arms knock it over is the experiment.
+            if self.object_x is None:
+                self.object_x = 0.0
+            if self.object_y is None:
+                self.object_y = 0.0
+            if self.grasp_center_z is None:
+                self.grasp_center_z = 0.0  # unused on the array mount
+            return
         if self.mount == "planar":
             default_x, default_y = DEFAULT_PLANAR_POSE
             if self.object_x is None:
