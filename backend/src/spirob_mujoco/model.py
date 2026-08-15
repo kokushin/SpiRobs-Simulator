@@ -371,6 +371,8 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
     if settings.mount == "array":
         if settings.object_kind == "soft_sphere":
             _add_floor_soft_object(worldbody, settings, radius)
+        elif settings.object_kind == "sausage":
+            _add_sausage(worldbody, root, settings, radius)
         else:
             _add_free_standing_object(worldbody, settings, radius)
         return
@@ -504,6 +506,77 @@ def _add_free_standing_object(
         ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
     elif settings.object_kind == "cylinder":
         ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, ROD_HALF_LENGTH), **common)
+
+
+# The sausage shares the wooden rod's dimensions (a thick 30 x 160 mm one):
+# the array schedule's approach/drape/deposit calibration is geometry-
+# sensitive, and matching the rod keeps the whole transport pipeline valid
+# so only the fragility threshold is new.
+SAUSAGE_HALF_LENGTH = 0.08
+# Fraction of the length in the lower segment. Deliberately NOT the
+# middle: the arms grip the z ~ 0.08..0.12 band, and a seam there puts
+# the upper cylinder's sharp rim into the grip — edge contacts slip
+# where the rod's smooth flank held (measured: 25 mm slip and a drop).
+SAUSAGE_SPLIT = 0.3125  # seam at 50 mm of 160
+
+
+def _add_sausage(
+    worldbody: ET.Element, root: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Fragile free-standing cylinder: two rigid segments welded together.
+
+    MuJoCo's flex bodies are purely elastic — there is no native fracture —
+    so breakage is modeled as a threshold event the controller watches
+    (``SpiRobSim._monitor_fragility``): when the summed contact normal
+    force on the segments exceeds ``object_crush_force``, the weld is
+    released (the sausage snaps) and the skin darkens. A lumped stand-in
+    for skin rupture: the threshold is a calibration, but the forces that
+    trip it come from the real contact solver.
+    """
+    length = 2 * SAUSAGE_HALF_LENGTH
+    lower_half = length * SAUSAGE_SPLIT * 0.5
+    upper_half = length * (1.0 - SAUSAGE_SPLIT) * 0.5
+    x, y = settings.object_x, settings.object_y
+    common = {
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
+        "rgba": "0.76 0.47 0.30 1",
+    }
+    lower = ET.SubElement(
+        worldbody, "body", name="object", pos=_fmt(x, y, lower_half + 0.002)
+    )
+    ET.SubElement(lower, "freejoint", name="object_free")
+    ET.SubElement(
+        lower, "geom", name="object_geom", type="cylinder",
+        size=_fmt(radius, lower_half),
+        mass=_fmt(settings.object_mass * SAUSAGE_SPLIT), **common,
+    )
+    upper = ET.SubElement(
+        worldbody, "body", name="object_top",
+        pos=_fmt(x, y, 2 * lower_half + upper_half + 0.002),
+    )
+    ET.SubElement(upper, "freejoint", name="object_top_free")
+    ET.SubElement(
+        upper, "geom", name="object_top_geom", type="cylinder",
+        size=_fmt(radius, upper_half),
+        mass=_fmt(settings.object_mass * (1.0 - SAUSAGE_SPLIT)), **common,
+    )
+    equality = ET.SubElement(root, "equality")
+    # Stiff weld (default solref 0.02 s lets the seam flex enough for the
+    # grip to slip — the welded sausage then drops where the equally-sized
+    # rigid rod carries fine).
+    ET.SubElement(
+        equality,
+        "weld",
+        name="sausage_weld",
+        body1="object",
+        body2="object_top",
+        solref="0.004 1",
+    )
+    # The two halves may touch at the junction; that contact would fight
+    # the weld, so exclude it.
+    contact = ET.SubElement(root, "contact")
+    ET.SubElement(contact, "exclude", body1="object", body2="object_top")
 
 
 def _add_held_object(

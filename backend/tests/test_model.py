@@ -187,7 +187,7 @@ def test_array_transports_free_standing_rod():
 
     lifted = 0.0
     t0 = sim.data.time
-    while sim.data.time - t0 < 29.0:
+    while sim.data.time - t0 < 31.5:
         sim.step(0.5)
         assert np.all(np.isfinite(sim.data.qpos))
         lifted = max(lifted, sim.data.xpos[obj_id][2])
@@ -197,3 +197,39 @@ def test_array_transports_free_standing_rod():
     zaxis = sim.data.xmat[obj_id].reshape(3, 3)[:, 2]
     assert pos[0] > 0.15  # transported toward the +X target
     assert zaxis[2] > 0.94  # still standing (< ~20 deg tilt)
+
+
+def test_sausage_crushed_by_default_squeeze():
+    """The fragility question, physics-side: the stock 15 N squeeze sums
+    to ~5.7 N of contact force on the sausage — past the 5.2 N skin
+    threshold — so the weld must snap during the squeeze."""
+    sim = make_sim(mount="array", object_kind="sausage")
+    sim.step(0.3)
+    sim.start_auto_grasp()
+    t0 = sim.data.time
+    while sim.data.time - t0 < 18.0 and not sim.object_broken:
+        sim.step(0.5)
+    assert sim.object_broken
+    assert sim.break_event["phase"] in ("squeezing", "lifting")
+    assert sim.data.eq_active[sim._sausage_weld_id] == 0
+    state = sim.state()
+    assert state["object"]["broken"] is True
+
+
+def test_sausage_carried_intact_with_gentle_squeeze():
+    """Grip force is the fragile-handling knob (the paper grasps raw eggs
+    and strawberries): at squeeze_force=11 the summed contact force stays
+    under the skin threshold and the sausage arrives standing and whole."""
+    sim = make_sim(mount="array", object_kind="sausage", squeeze_force=11.0)
+    obj_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "object")
+    sim.step(0.3)
+    sim.start_auto_grasp()
+    t0 = sim.data.time
+    while sim.data.time - t0 < 31.5:
+        sim.step(0.5)
+        assert np.all(np.isfinite(sim.data.qpos))
+    assert not sim.object_broken
+    pos = sim.data.xpos[obj_id]
+    zaxis = sim.data.xmat[obj_id].reshape(3, 3)[:, 2]
+    assert pos[0] > 0.15  # transported
+    assert zaxis[2] > 0.94  # standing, in one piece

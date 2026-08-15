@@ -30,6 +30,18 @@ def main() -> None:
         help="arm count on the gantry ring (array mount only; default 3)",
     )
     parser.add_argument("--stiffness", type=float, default=0.7, help="base joint stiffness [Nm/rad]")
+    parser.add_argument(
+        "--squeeze",
+        type=float,
+        default=None,
+        help="array firm-grip tension [N] (default: schedule's 15; lower it for fragile objects)",
+    )
+    parser.add_argument(
+        "--crush",
+        type=float,
+        default=None,
+        help="sausage crush threshold: contact normal force that snaps it [N]",
+    )
     parser.add_argument("--young", type=float, default=2.0e4, help="soft object Young's modulus [Pa]")
     parser.add_argument("--grasp", action="store_true", help="run the paper's auto-grasp sequence")
     parser.add_argument("--forces", type=float, nargs=3, default=None, metavar=("C0", "C1", "C2"))
@@ -44,6 +56,8 @@ def main() -> None:
             arm_count=args.arms,
             stiffness=args.stiffness,
             object_young=args.young,
+            squeeze_force=args.squeeze,
+            **({"object_crush_force": args.crush} if args.crush is not None else {}),
         )
     )
     if args.grasp:

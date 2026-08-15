@@ -20,11 +20,11 @@ import numpy as np
 from .grasp import (
     F_SQUEEZE,
     RETREAT_DZ,
-    TA_LIFT,
     T_PACK,
     T_REACH,
     T_RELEASE,
     array_grasp_command,
+    array_lift_end,
     auto_grasp_command,
 )
 from .model import build_mjcf, pedestal_far_offset
@@ -105,7 +105,39 @@ class SpiRobSim:
         self._object_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "object_geom"
         )
+        # All geoms belonging to the object (the fragile sausage has two).
+        self._object_geom_ids = {
+            gid
+            for gid in (
+                self._object_geom_id,
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM, "object_top_geom"
+                ),
+            )
+            if gid >= 0
+        }
+        self._object_top_body_id = body_id("object_top")
         self._flex_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_FLEX, "object")
+
+        self._floor_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+        )
+        # Fragile-object state (sausage): the mid weld snaps and the skin
+        # darkens once the summed grip force exceeds the crush threshold.
+        self._sausage_weld_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, "sausage_weld"
+        )
+        self._object_rgba0 = {
+            gid: self.model.geom_rgba[gid].copy() for gid in self._object_geom_ids
+        }
+        self.object_broken = False
+        self.peak_contact_force = 0.0
+        self.break_event: dict | None = None
+        self._array_squeeze = (
+            self.settings.squeeze_force
+            if self.settings.squeeze_force is not None
+            else F_SQUEEZE
+        )
 
         # Stage servo: last actuator; its ctrl is the slide-joint offset
         # relative to the far parking position.
@@ -222,6 +254,11 @@ class SpiRobSim:
         self._array_abort_time = None
         self._array_abort_state = None
         self._contact_lost_since = None
+        self.object_broken = False
+        self.peak_contact_force = 0.0
+        self.break_event = None
+        for gid, rgba in self._object_rgba0.items():
+            self.model.geom_rgba[gid] = rgba
         self._apply_forces([0.0, 0.0, 0.0])
         mujoco.mj_forward(self.model, self.data)
 
@@ -272,7 +309,12 @@ class SpiRobSim:
         (compact, tips high), the gantry retreats vertically, and only
         then do the cables release.
         """
-        command = array_grasp_command(elapsed)
+        command = array_grasp_command(
+            elapsed,
+            self._array_squeeze,
+            self.settings.approach_dz,
+            self.settings.approach_duration,
+        )
 
         if self._array_abort_time is None:
             # Contact loss counts as a dropped object only while the
@@ -280,7 +322,9 @@ class SpiRobSim:
             # releasing/retreating phases zero contact is the goal, and
             # aborting there would re-curl the arms onto the deposited
             # object and drag it away.
-            if elapsed > TA_LIFT and command.phase in ("carrying", "lowering"):
+            if elapsed > array_lift_end(
+                self.settings.approach_duration
+            ) and command.phase in ("carrying", "lowering"):
                 if any(self.contacting_units_per_arm()):
                     self._contact_lost_since = None
                 else:
@@ -299,11 +343,12 @@ class SpiRobSim:
         u = elapsed - self._array_abort_time
         if u < 2.0:
             phase = "retreating"
-            curl = max(curl0, F_SQUEEZE)  # hold the curl compact while rising
+            # hold the curl compact while rising
+            curl = max(curl0, self._array_squeeze)
             dz = dz0 + (RETREAT_DZ - dz0) * _smoothstep(u / 2.0)
         elif u < 3.0:
             phase = "releasing"
-            curl = F_SQUEEZE * (1.0 - _smoothstep(u - 2.0))
+            curl = self._array_squeeze * (1.0 - _smoothstep(u - 2.0))
             dz = RETREAT_DZ
         else:
             phase = "done"
@@ -312,6 +357,44 @@ class SpiRobSim:
         return type(command)(
             phase=phase, cable_forces=(curl, 0.0, 0.0), gantry_offset=(dx, dy, dz)
         )
+
+    def _monitor_fragility(self) -> None:
+        """Crush detection for the fragile object (call after mj_step).
+
+        The crush metric is the SUM of all contact normal forces on the
+        object — the total radial compression of the cylinder, like a
+        fist closing around it. (A single-contact maximum does not
+        discriminate grip strength here: the drape spreads the squeeze
+        over many contacts of ~1 N each.) Crossing ``object_crush_force``
+        snaps the mid weld and darkens the skin — one-way until reset().
+        """
+        if self._sausage_weld_id < 0:
+            return
+        force = np.zeros(6)
+        total = 0.0
+        for i in range(self.data.ncon):
+            geoms = (self.data.contact[i].geom[0], self.data.contact[i].geom[1])
+            if geoms[0] not in self._object_geom_ids and (
+                geoms[1] not in self._object_geom_ids
+            ):
+                continue
+            # The floor is support, not grip: its reaction (mg at rest,
+            # spiking on any bump) would pollute the crush metric.
+            if self._floor_geom_id in geoms:
+                continue
+            mujoco.mj_contactForce(self.model, self.data, i, force)
+            total += force[0]
+        self.peak_contact_force = max(self.peak_contact_force, total)
+        if not self.object_broken and total > self.settings.object_crush_force:
+            self.object_broken = True
+            self.break_event = {
+                "time": float(self.data.time),
+                "force": float(total),
+                "phase": self.grasp_phase,
+            }
+            self.data.eq_active[self._sausage_weld_id] = 0
+            for gid in self._object_geom_ids:
+                self.model.geom_rgba[gid] = (0.45, 0.24, 0.16, 1.0)
 
     def step(self, duration: float) -> None:
         steps = max(1, round(duration / self.model.opt.timestep))
@@ -333,6 +416,7 @@ class SpiRobSim:
                         self.release_object()
             self._apply_capstan()
             mujoco.mj_step(self.model, self.data)
+            self._monitor_fragility()
 
     # ------------------------------------------------------------------ state
 
@@ -342,10 +426,13 @@ class SpiRobSim:
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             geoms = (contact.geom[0], contact.geom[1])
-            if self._object_geom_id >= 0:
-                if self._object_geom_id not in geoms:
+            if self._object_geom_ids:
+                if geoms[0] in self._object_geom_ids:
+                    other = geoms[1]
+                elif geoms[1] in self._object_geom_ids:
+                    other = geoms[0]
+                else:
                     continue
-                other = geoms[0] if geoms[1] == self._object_geom_id else geoms[1]
             elif self._flex_id >= 0:
                 flexes = (contact.flex[0], contact.flex[1])
                 if self._flex_id not in flexes:
@@ -407,6 +494,17 @@ class SpiRobSim:
                 "pos": self.data.xpos[self._object_body_id].tolist(),
                 "quat": self.data.xquat[self._object_body_id].tolist(),
             }
+            if self._object_top_body_id >= 0:
+                state["object"]["topPos"] = self.data.xpos[
+                    self._object_top_body_id
+                ].tolist()
+                state["object"]["topQuat"] = self.data.xquat[
+                    self._object_top_body_id
+                ].tolist()
+            if self._sausage_weld_id >= 0:
+                state["object"]["broken"] = self.object_broken
+                state["object"]["peakContactForce"] = self.peak_contact_force
+                state["object"]["breakEvent"] = self.break_event
         elif self._flex_id >= 0:
             state["object"] = {
                 "kind": self.settings.object_kind,

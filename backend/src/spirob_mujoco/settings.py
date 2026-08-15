@@ -8,7 +8,7 @@ similarity law), masses are kilograms, sizes are millimeters.
 from dataclasses import dataclass, field
 
 
-OBJECT_KINDS = ("sphere", "box", "cylinder", "soft_sphere", "none")
+OBJECT_KINDS = ("sphere", "box", "cylinder", "soft_sphere", "sausage", "none")
 MOUNTS = ("planar", "hanging", "horizontal", "standing", "array")
 
 
@@ -99,6 +99,28 @@ class SimSettings:
     arm_count: int | None = None
     ring_radius: float = 0.05
     base_height: float = 0.20
+    # Fragile object ("sausage"): two rigid segments held by a weld that
+    # snaps — and the skin darkens — when the SUMMED contact normal force
+    # on the object exceeds this [N] (total radial compression; floor
+    # support excluded). A lumped stand-in for skin rupture, not a
+    # continuum damage model; see model.py. Calibrated between the two
+    # grip levels: the stock 15 N squeeze peaks at ~5.7 N summed and
+    # crushes the sausage mid-squeeze, while squeeze_force=11 stays at
+    # ~4.6 N and carries it through the whole mission intact.
+    object_crush_force: float = 5.2
+    # Array-mount override for the firm-grip tension [N] (None = the
+    # schedule's default F_SQUEEZE). The knob the fragile-object demo
+    # turns: enough to lift, below the crush threshold at the contacts.
+    squeeze_force: float | None = None
+    # Array approach trajectory: pack altitude [m] and descent time [s].
+    # Per-object calibration in the spirit of the paper's linear tension
+    # rule (None = pick by object_kind): rigid objects use 0.14 / 3 s — a
+    # slower descent lets the packed spirals creep tighter and their
+    # proximal bulge knocks the rod over — while the fragile sausage uses
+    # 0.18 / 5 s, whose higher, slower pass removes the ~2 N pack grazes
+    # and the ~7 N approach bump that would burst its skin.
+    approach_dz: float | None = None
+    approach_duration: float | None = None
 
     def __post_init__(self) -> None:
         if self.object_kind not in OBJECT_KINDS:
@@ -109,6 +131,12 @@ class SimSettings:
             self.arm_count = 3 if self.mount == "array" else 1
         if self.mount != "array" and self.arm_count != 1:
             raise ValueError("multiple arms are only supported on the array mount")
+        if self.object_kind == "sausage" and self.mount != "array":
+            raise ValueError("the fragile sausage is only modeled for the array mount")
+        if self.approach_dz is None:
+            self.approach_dz = 0.18 if self.object_kind == "sausage" else 0.14
+        if self.approach_duration is None:
+            self.approach_duration = 5.0 if self.object_kind == "sausage" else 3.0
         if self.mount == "array":
             # The object stands free at the gantry axis (no hand, no rig):
             # whether the arms knock it over is the experiment.
