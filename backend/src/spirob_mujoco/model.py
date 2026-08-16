@@ -14,7 +14,7 @@ simulator (root y=0.08, floor y=-0.12).
 """
 
 import xml.etree.ElementTree as ET
-from math import cos, radians, sin
+from math import cos, pi, radians, sin
 
 from .settings import SimSettings
 from .unit_data import MM, UNIT_COUNT, UNIT_DATA, along_m, cable_radius_m, unit_volumes
@@ -50,13 +50,43 @@ def pedestal_far_offset(mount: str) -> float:
     hanging/horizontal scenes, +X for the standing scene whose packing
     spiral curls toward +X. Planar has no stage (the rod is hand-held).
     """
-    if mount == "planar":
+    if mount in ("planar", "array"):
         return 0.0
     return 0.15 if mount == "standing" else -0.13
 
 
 def _fmt(*values: float) -> str:
     return " ".join(f"{v:.8g}" for v in values)
+
+
+def _quat_mul(a: tuple, b: tuple) -> tuple:
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _array_arm_pose(settings: SimSettings, k: int) -> tuple[tuple, tuple]:
+    """Base pos (gantry-relative) and quat for arm ``k`` on the ring.
+
+    Each arm hangs tip-down (local +X -> world -Z) with its packing
+    cable 0 (local -Z of the cross-section) facing the gantry axis, so
+    tensioning cable 0 curls the arm radially inward onto the object.
+    quat = Rz(azimuth) * Ry(90 deg).
+    """
+    azimuth = 2.0 * pi * k / settings.arm_count
+    pos = (
+        settings.ring_radius * cos(azimuth),
+        settings.ring_radius * sin(azimuth),
+        0.0,
+    )
+    qz = (cos(azimuth * 0.5), 0.0, 0.0, sin(azimuth * 0.5))
+    qy90 = (cos(pi / 4), 0.0, sin(pi / 4), 0.0)
+    return pos, _quat_mul(qz, qy90)
 
 
 def _joint_gains(settings: SimSettings, i: int) -> tuple[float, float, float]:
@@ -127,108 +157,72 @@ def build_mjcf(settings: SimSettings) -> str:
         **floor_attrs,
     )
 
-    volumes = unit_volumes()
-    volume_sum = sum(volumes)
-
-    parent = worldbody
-    for i, (_, length, h, w) in enumerate(UNIT_DATA):
-        if i == 0:
-            pose = MOUNT_POSE[settings.mount]
-            body = ET.SubElement(
-                parent,
-                "body",
-                name="unit00",
-                pos=_fmt(*pose["pos"]),
-                quat=_fmt(*pose["quat"]),
-            )
-        else:
-            separation = along_m(i) - along_m(i - 1)
-            body = ET.SubElement(parent, "body", name=f"unit{i:02d}", pos=_fmt(separation, 0, 0))
-            gap = max(0.0, separation - (UNIT_DATA[i - 1][1] + length) * 0.5 * MM)
-            joint_x = -(length * 0.5 * MM + gap * 0.5)
-            stiffness, damping, armature = _joint_gains(settings, i)
-            for axis_name, axis in (("y", "0 1 0"), ("z", "0 0 1")):
-                ET.SubElement(
-                    body,
-                    "joint",
-                    name=f"u{i:02d}_{axis_name}",
-                    type="hinge",
-                    axis=axis,
-                    pos=_fmt(joint_x, 0, 0),
-                    range=_fmt(-JOINT_RANGE_DEG, JOINT_RANGE_DEG),
-                    stiffness=_fmt(stiffness),
-                    damping=_fmt(damping),
-                    armature=_fmt(armature),
-                )
-
-        mass = settings.total_mass * volumes[i] / volume_sum
-        ET.SubElement(
-            body,
-            "geom",
-            name=f"unit{i:02d}_geom",
-            type="box",
-            size=_fmt(length * MM * 0.47, h * MM * 0.43, w * MM * 0.43),
-            mass=_fmt(mass),
-            rgba="0.92 0.92 0.95 1",
-        )
-
-        # Cable 0 runs along the bottom of the cross-section (-Z): packing it
-        # coils the arm downward toward the presented object, while cables 1/2
-        # sit symmetrically on the upper half so their sum opposes cable 0 in
-        # the vertical plane — the planar antagonism of the paper's sequence.
-        radius = cable_radius_m(i)
-        for c, phase in enumerate(CABLE_PHASES_DEG):
-            ET.SubElement(
-                body,
-                "site",
-                name=f"u{i:02d}_c{c}",
-                pos=_fmt(
-                    0,
-                    -radius * sin(radians(phase)),
-                    -radius * cos(radians(phase)),
-                ),
-            )
-        parent = body
+    if settings.mount == "array":
+        gantry = _add_gantry(worldbody, settings)
+        prefixes = [f"a{k}_" for k in range(settings.arm_count)]
+        for k, prefix in enumerate(prefixes):
+            pos, quat = _array_arm_pose(settings, k)
+            _add_arm(gantry, prefix, settings, pos, quat)
+    else:
+        prefixes = [""]
+        pose = MOUNT_POSE[settings.mount]
+        _add_arm(worldbody, "", settings, pose["pos"], pose["quat"])
 
     _add_object(worldbody, root, settings)
 
     contact = ET.SubElement(root, "contact")
-    for i in range(1, UNIT_COUNT):
-        ET.SubElement(
-            contact,
-            "exclude",
-            body1=f"unit{i - 1:02d}",
-            body2=f"unit{i:02d}",
-        )
+    for prefix in prefixes:
+        for i in range(1, UNIT_COUNT):
+            ET.SubElement(
+                contact,
+                "exclude",
+                body1=f"{prefix}unit{i - 1:02d}",
+                body2=f"{prefix}unit{i:02d}",
+            )
 
     # Each cable is split into per-joint tendon segments so the controller
     # can impose the capstan law T_i = T0 * exp(-mu * sum |dtheta|): a single
     # continuous MuJoCo tendon equalizes tension along its whole path, which
     # erases exactly the pack/unwind asymmetry the paper's antagonistic
-    # grasp sequence depends on. Actuator order: cable-major, then joint.
+    # grasp sequence depends on. Actuator order: arm-major, then cable,
+    # then joint — the capstan controller relies on this layout.
     tendon = ET.SubElement(root, "tendon")
     actuator = ET.SubElement(root, "actuator")
-    for c in range(3):
-        for i in range(1, UNIT_COUNT):
-            spatial = ET.SubElement(
-                tendon,
-                "spatial",
-                name=f"cable{c}_seg{i:02d}",
-                width="0.0004",
-                rgba="0.85 0.4 0.15 1",
-            )
-            ET.SubElement(spatial, "site", site=f"u{i - 1:02d}_c{c}")
-            ET.SubElement(spatial, "site", site=f"u{i:02d}_c{c}")
+    for prefix in prefixes:
+        for c in range(3):
+            for i in range(1, UNIT_COUNT):
+                spatial = ET.SubElement(
+                    tendon,
+                    "spatial",
+                    name=f"{prefix}cable{c}_seg{i:02d}",
+                    width="0.0004",
+                    rgba="0.85 0.4 0.15 1",
+                )
+                ET.SubElement(spatial, "site", site=f"{prefix}u{i - 1:02d}_c{c}")
+                ET.SubElement(spatial, "site", site=f"{prefix}u{i:02d}_c{c}")
+                ET.SubElement(
+                    actuator,
+                    "motor",
+                    name=f"{prefix}cable{c}_seg{i:02d}_motor",
+                    tendon=f"{prefix}cable{c}_seg{i:02d}",
+                    gear="-1",
+                    ctrlrange=_fmt(0, MAX_CABLE_FORCE),
+                )
+
+    if settings.mount == "array":
+        # Gantry servos (always the LAST actuators, after every cable
+        # motor): ctrl is the slide offset from the starting pose.
+        for axis in ("x", "y", "z"):
             ET.SubElement(
                 actuator,
-                "motor",
-                name=f"cable{c}_seg{i:02d}_motor",
-                tendon=f"cable{c}_seg{i:02d}",
-                gear="-1",
-                ctrlrange=_fmt(0, MAX_CABLE_FORCE),
+                "position",
+                name=f"gantry_{axis}",
+                joint=f"gantry_{axis}",
+                kp="1500",
+                kv="200",
+                ctrlrange=_fmt(-0.4, 0.4),
             )
-
-    if settings.object_kind != "none" and _uses_stage(settings):
+    elif settings.object_kind != "none" and _uses_stage(settings):
         # Stage servo (always the LAST actuator; the capstan controller
         # relies on the cable motors occupying ctrl[0:57]).
         ET.SubElement(
@@ -244,6 +238,107 @@ def build_mjcf(settings: SimSettings) -> str:
     return ET.tostring(root, encoding="unicode")
 
 
+def _add_gantry(worldbody: ET.Element, settings: SimSettings) -> ET.Element:
+    """Transport gantry for the array mount: an XYZ-slide platform with
+    position servos, so the ring has real velocities and accelerations
+    while it lifts and carries the entangled object (paper Fig. 6 hangs
+    the array from a rigid robot arm)."""
+    gantry = ET.SubElement(
+        worldbody,
+        "body",
+        name="gantry",
+        pos=_fmt(0.0, 0.0, settings.base_height),
+    )
+    for axis, direction in (("x", "1 0 0"), ("y", "0 1 0"), ("z", "0 0 1")):
+        ET.SubElement(
+            gantry,
+            "joint",
+            name=f"gantry_{axis}",
+            type="slide",
+            axis=direction,
+            range="-0.5 0.5",
+            damping="30",
+        )
+    # Visual-only ring plate; the arms provide the contact.
+    ET.SubElement(
+        gantry,
+        "geom",
+        name="gantry_plate",
+        type="cylinder",
+        size=_fmt(settings.ring_radius + 0.03, 0.004),
+        mass="0.4",
+        contype="0",
+        conaffinity="0",
+        rgba="0.45 0.47 0.52 1",
+    )
+    return gantry
+
+
+def _add_arm(parent: ET.Element, prefix: str, settings: SimSettings, pos, quat) -> None:
+    volumes = unit_volumes()
+    volume_sum = sum(volumes)
+
+    for i, (_, length, h, w) in enumerate(UNIT_DATA):
+        if i == 0:
+            body = ET.SubElement(
+                parent,
+                "body",
+                name=f"{prefix}unit00",
+                pos=_fmt(*pos),
+                quat=_fmt(*quat),
+            )
+        else:
+            separation = along_m(i) - along_m(i - 1)
+            body = ET.SubElement(
+                parent, "body", name=f"{prefix}unit{i:02d}", pos=_fmt(separation, 0, 0)
+            )
+            gap = max(0.0, separation - (UNIT_DATA[i - 1][1] + length) * 0.5 * MM)
+            joint_x = -(length * 0.5 * MM + gap * 0.5)
+            stiffness, damping, armature = _joint_gains(settings, i)
+            for axis_name, axis in (("y", "0 1 0"), ("z", "0 0 1")):
+                ET.SubElement(
+                    body,
+                    "joint",
+                    name=f"{prefix}u{i:02d}_{axis_name}",
+                    type="hinge",
+                    axis=axis,
+                    pos=_fmt(joint_x, 0, 0),
+                    range=_fmt(-JOINT_RANGE_DEG, JOINT_RANGE_DEG),
+                    stiffness=_fmt(stiffness),
+                    damping=_fmt(damping),
+                    armature=_fmt(armature),
+                )
+
+        mass = settings.total_mass * volumes[i] / volume_sum
+        ET.SubElement(
+            body,
+            "geom",
+            name=f"{prefix}unit{i:02d}_geom",
+            type="box",
+            size=_fmt(length * MM * 0.47, h * MM * 0.43, w * MM * 0.43),
+            mass=_fmt(mass),
+            rgba="0.92 0.92 0.95 1",
+        )
+
+        # Cable 0 runs along the bottom of the cross-section (-Z): packing it
+        # coils the arm downward toward the presented object, while cables 1/2
+        # sit symmetrically on the upper half so their sum opposes cable 0 in
+        # the vertical plane — the planar antagonism of the paper's sequence.
+        radius = cable_radius_m(i)
+        for c, phase in enumerate(CABLE_PHASES_DEG):
+            ET.SubElement(
+                body,
+                "site",
+                name=f"{prefix}u{i:02d}_c{c}",
+                pos=_fmt(
+                    0,
+                    -radius * sin(radians(phase)),
+                    -radius * cos(radians(phase)),
+                ),
+            )
+        parent = body
+
+
 STRING_ANCHOR_DROP = 0.25  # string length: anchor sits this far above the object
 
 
@@ -256,9 +351,10 @@ def _uses_stage(settings: SimSettings) -> bool:
     making form closure geometrically impossible — rigid objects hang from
     a string instead, and soft objects rest on the floor (the paper's
     Fig. 5C table scenario — no string attachment point exists on a flex
-    body).
+    body). The array scene never uses it: the object stands free on the
+    floor under the gantry.
     """
-    return settings.mount not in ("standing", "planar")
+    return settings.mount not in ("standing", "planar", "array")
 
 
 ROD_HALF_LENGTH = 0.08  # planar rod: 16 cm of vertical wooden rod
@@ -272,6 +368,14 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
     if settings.object_kind == "none":
         return
     radius = settings.object_size_mm * MM * 0.5
+    if settings.mount == "array":
+        if settings.object_kind == "soft_sphere":
+            _add_floor_soft_object(worldbody, settings, radius)
+        elif settings.object_kind == "sausage":
+            _add_sausage(worldbody, root, settings, radius)
+        else:
+            _add_free_standing_object(worldbody, settings, radius)
+        return
     if settings.mount == "planar":
         if settings.object_kind == "soft_sphere":
             _add_floor_soft_object(worldbody, settings, radius)
@@ -366,6 +470,113 @@ def _add_object(worldbody: ET.Element, root: ET.Element, settings: SimSettings) 
         ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
     elif settings.object_kind == "cylinder":
         ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, radius), **common)
+
+
+def _add_free_standing_object(
+    worldbody: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Rigid object standing free on the floor at the gantry axis (array).
+
+    Nothing holds it — no hand, no string, no stage. Whether the curling
+    arms knock it over before the entanglement closes is exactly what the
+    scene measures (the paper flags the uncurling push force as the open
+    problem its multi-arm array alleviates).
+    """
+    if settings.object_kind == "cylinder":
+        z = ROD_HALF_LENGTH + 0.002
+    else:
+        z = radius + 0.002
+    body = ET.SubElement(
+        worldbody,
+        "body",
+        name="object",
+        pos=_fmt(settings.object_x, settings.object_y, z),
+    )
+    ET.SubElement(body, "freejoint", name="object_free")
+    common = {
+        "name": "object_geom",
+        "mass": _fmt(settings.object_mass),
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
+        "rgba": "0.78 0.62 0.42 1",
+    }
+    if settings.object_kind == "sphere":
+        ET.SubElement(body, "geom", type="sphere", size=_fmt(radius), **common)
+    elif settings.object_kind == "box":
+        ET.SubElement(body, "geom", type="box", size=_fmt(radius, radius, radius), **common)
+    elif settings.object_kind == "cylinder":
+        ET.SubElement(body, "geom", type="cylinder", size=_fmt(radius, ROD_HALF_LENGTH), **common)
+
+
+# The sausage shares the wooden rod's dimensions (a thick 30 x 160 mm one):
+# the array schedule's approach/drape/deposit calibration is geometry-
+# sensitive, and matching the rod keeps the whole transport pipeline valid
+# so only the fragility threshold is new.
+SAUSAGE_HALF_LENGTH = 0.08
+# Fraction of the length in the lower segment. Deliberately NOT the
+# middle: the arms grip the z ~ 0.08..0.12 band, and a seam there puts
+# the upper cylinder's sharp rim into the grip — edge contacts slip
+# where the rod's smooth flank held (measured: 25 mm slip and a drop).
+SAUSAGE_SPLIT = 0.3125  # seam at 50 mm of 160
+
+
+def _add_sausage(
+    worldbody: ET.Element, root: ET.Element, settings: SimSettings, radius: float
+) -> None:
+    """Fragile free-standing cylinder: two rigid segments welded together.
+
+    MuJoCo's flex bodies are purely elastic — there is no native fracture —
+    so breakage is modeled as a threshold event the controller watches
+    (``SpiRobSim._monitor_fragility``): when the summed contact normal
+    force on the segments exceeds ``object_crush_force``, the weld is
+    released (the sausage snaps) and the skin darkens. A lumped stand-in
+    for skin rupture: the threshold is a calibration, but the forces that
+    trip it come from the real contact solver.
+    """
+    length = 2 * SAUSAGE_HALF_LENGTH
+    lower_half = length * SAUSAGE_SPLIT * 0.5
+    upper_half = length * (1.0 - SAUSAGE_SPLIT) * 0.5
+    x, y = settings.object_x, settings.object_y
+    common = {
+        "condim": "6",
+        "friction": _fmt(0.92, 0.02, 0.02),
+        "rgba": "0.76 0.47 0.30 1",
+    }
+    lower = ET.SubElement(
+        worldbody, "body", name="object", pos=_fmt(x, y, lower_half + 0.002)
+    )
+    ET.SubElement(lower, "freejoint", name="object_free")
+    ET.SubElement(
+        lower, "geom", name="object_geom", type="cylinder",
+        size=_fmt(radius, lower_half),
+        mass=_fmt(settings.object_mass * SAUSAGE_SPLIT), **common,
+    )
+    upper = ET.SubElement(
+        worldbody, "body", name="object_top",
+        pos=_fmt(x, y, 2 * lower_half + upper_half + 0.002),
+    )
+    ET.SubElement(upper, "freejoint", name="object_top_free")
+    ET.SubElement(
+        upper, "geom", name="object_top_geom", type="cylinder",
+        size=_fmt(radius, upper_half),
+        mass=_fmt(settings.object_mass * (1.0 - SAUSAGE_SPLIT)), **common,
+    )
+    equality = ET.SubElement(root, "equality")
+    # Stiff weld (default solref 0.02 s lets the seam flex enough for the
+    # grip to slip — the welded sausage then drops where the equally-sized
+    # rigid rod carries fine).
+    ET.SubElement(
+        equality,
+        "weld",
+        name="sausage_weld",
+        body1="object",
+        body2="object_top",
+        solref="0.004 1",
+    )
+    # The two halves may touch at the junction; that contact would fight
+    # the weld, so exclude it.
+    contact = ET.SubElement(root, "contact")
+    ET.SubElement(contact, "exclude", body1="object", body2="object_top")
 
 
 def _add_held_object(

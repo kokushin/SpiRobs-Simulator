@@ -156,3 +156,80 @@ def test_paper_sequence_reaches_object(kind):
 def test_mjcf_is_valid_xml():
     xml = build_mjcf(SimSettings(object_kind="none"))
     assert xml.startswith("<mujoco")
+
+
+@pytest.mark.parametrize("arms", [2, 3, 8])
+def test_array_model_structure(arms):
+    sim = make_sim(object_kind="none", mount="array", arm_count=arms)
+    assert sim.arm_count == arms
+    # N arms x 19 joint pairs + no object; N arms x 57 cable motors + 3
+    # gantry slides/servos.
+    assert sim.model.nq == arms * 2 * (UNIT_COUNT - 1) + 3
+    assert sim.model.nu == arms * 3 * (UNIT_COUNT - 1) + 3
+
+
+def test_array_defaults_to_three_arms():
+    sim = make_sim(object_kind="none", mount="array")
+    assert sim.arm_count == 3
+
+
+def test_array_transports_free_standing_rod():
+    """The paper's multi-arm claim, end to end with the Fig. 6B sequence:
+    the arms pack, approach from above, drape down around a rod that
+    nothing holds (their radial pushes must cancel or it topples),
+    squeeze, lift, carry ~20 cm, set it down under grip control, and
+    leave — flaring the claw open with the opposing cables so the rising
+    cage never brushes the deposited rod."""
+    sim = make_sim(mount="array")  # default 30 mm / 70 g rod
+    obj_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "object")
+    sim.step(0.3)
+    sim.start_auto_grasp()
+
+    lifted = 0.0
+    t0 = sim.data.time
+    while sim.data.time - t0 < 31.5:
+        sim.step(0.5)
+        assert np.all(np.isfinite(sim.data.qpos))
+        lifted = max(lifted, sim.data.xpos[obj_id][2])
+
+    assert lifted > 0.11  # the 160 mm rod's center started at 0.08
+    pos = sim.data.xpos[obj_id]
+    zaxis = sim.data.xmat[obj_id].reshape(3, 3)[:, 2]
+    assert pos[0] > 0.15  # transported toward the +X target
+    assert zaxis[2] > 0.94  # still standing (< ~20 deg tilt)
+
+
+def test_sausage_crushed_by_default_squeeze():
+    """The fragility question, physics-side: the stock 15 N squeeze sums
+    to ~5.7 N of contact force on the sausage — past the 5.2 N skin
+    threshold — so the weld must snap during the squeeze."""
+    sim = make_sim(mount="array", object_kind="sausage")
+    sim.step(0.3)
+    sim.start_auto_grasp()
+    t0 = sim.data.time
+    while sim.data.time - t0 < 18.0 and not sim.object_broken:
+        sim.step(0.5)
+    assert sim.object_broken
+    assert sim.break_event["phase"] in ("squeezing", "lifting")
+    assert sim.data.eq_active[sim._sausage_weld_id] == 0
+    state = sim.state()
+    assert state["object"]["broken"] is True
+
+
+def test_sausage_carried_intact_with_gentle_squeeze():
+    """Grip force is the fragile-handling knob (the paper grasps raw eggs
+    and strawberries): at squeeze_force=11 the summed contact force stays
+    under the skin threshold and the sausage arrives standing and whole."""
+    sim = make_sim(mount="array", object_kind="sausage", squeeze_force=11.0)
+    obj_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "object")
+    sim.step(0.3)
+    sim.start_auto_grasp()
+    t0 = sim.data.time
+    while sim.data.time - t0 < 31.5:
+        sim.step(0.5)
+        assert np.all(np.isfinite(sim.data.qpos))
+    assert not sim.object_broken
+    pos = sim.data.xpos[obj_id]
+    zaxis = sim.data.xmat[obj_id].reshape(3, 3)[:, 2]
+    assert pos[0] > 0.15  # transported
+    assert zaxis[2] > 0.94  # standing, in one piece
